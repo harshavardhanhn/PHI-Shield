@@ -123,15 +123,17 @@ class PHIDetector:
         if not entities:
             return 0
 
-        # Tuned so demo bands match: SSN/identity fields drive high scores,
-        # while a name + medical term + DOB combo lands in medium (30-70).
+        # Per-entity base weights. Chosen so that:
+        #   Low (<30):  benign single-token hits (e.g. a standalone year)
+        #   Medium (30-70): name + medical/DOB combo without a hard identifier
+        #   High (>70): name + SSN, or many co-occurring PHI fields
         weights = {
-            "SSN": 40,
-            "DOB": 15,
-            "PHONE": 10,
-            "EMAIL": 8,
-            "PERSON": 12,
-            "MEDICAL_TERM": 15,
+            "SSN": 40,          # Hard identifier – highest individual weight
+            "DOB": 15,          # Date of birth – medium-high
+            "PHONE": 10,        # Phone number
+            "EMAIL": 8,         # Email address
+            "PERSON": 12,       # Named person
+            "MEDICAL_TERM": 15, # Disease / medication keyword
             "CONTEXT_ENTITY": 6,
         }
 
@@ -146,12 +148,15 @@ class PHIDetector:
         has_identifier = any(label in labels for label in ["SSN", "DOB", "PHONE", "EMAIL"])
         has_health_context = any(label in labels for label in ["PERSON", "MEDICAL_TERM"])
 
-        if has_identifier and has_health_context:
-            score += 15
-        if len(labels.keys()) >= 3:
-            score += 8
+        # Most specific check first: named person + SSN is the highest-risk combo.
         if labels.get("SSN", 0) > 0 and labels.get("PERSON", 0) > 0:
             score += 15
+        # General identifier + health context (e.g. name + DOB, phone + medical term).
+        if has_identifier and has_health_context:
+            score += 15
+        # Three or more distinct entity types suggest a rich, sensitive record.
+        if len(labels.keys()) >= 3:
+            score += 8
 
         return max(0, min(100, score))
 
