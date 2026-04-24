@@ -123,14 +123,16 @@ class PHIDetector:
         if not entities:
             return 0
 
+        # Tuned so demo bands match: SSN/identity fields drive high scores,
+        # while a name + medical term + DOB combo lands in medium (30-70).
         weights = {
-            "SSN": 45,
-            "DOB": 20,
-            "PHONE": 15,
-            "EMAIL": 10,
-            "PERSON": 15,
-            "MEDICAL_TERM": 18,
-            "CONTEXT_ENTITY": 8,
+            "SSN": 40,
+            "DOB": 15,
+            "PHONE": 10,
+            "EMAIL": 8,
+            "PERSON": 12,
+            "MEDICAL_TERM": 15,
+            "CONTEXT_ENTITY": 6,
         }
 
         score = 0
@@ -145,11 +147,11 @@ class PHIDetector:
         has_health_context = any(label in labels for label in ["PERSON", "MEDICAL_TERM"])
 
         if has_identifier and has_health_context:
-            score += 20
-        if len(labels.keys()) >= 3:
             score += 15
+        if len(labels.keys()) >= 3:
+            score += 8
         if labels.get("SSN", 0) > 0 and labels.get("PERSON", 0) > 0:
-            score += 20
+            score += 15
 
         return max(0, min(100, score))
 
