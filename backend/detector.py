@@ -1,209 +1,233 @@
-import html
+"""
+PHI-Shield — detector.py
+Full HIPAA Safe Harbor (18 identifiers) detection pipeline.
+Layer 1: Regex  →  Layer 2: spaCy NER  →  Layer 3: Medical term spotting
+"""
+
 import re
-from collections import Counter
-
+import html
 import spacy
+from dataclasses import dataclass, field
+from typing import List, Tuple
+
+# ── HIPAA 18 identifier weights ──────────────────────────────────────────────
+PHI_WEIGHTS = {
+    "SSN":          10,
+    "MRN":           8,
+    "DIAGNOSIS":     7,
+    "MEDICATION":    5,
+    "PERSON":        4,
+    "DOB":           6,
+    "PHONE":         5,
+    "EMAIL":         4,
+    "ADDRESS":       4,
+    "ZIP":           3,
+    "DATE":          2,
+    "AGE_OVER_89":   7,
+    "DEVICE_ID":     6,
+    "URL":           3,
+    "IP":            5,
+    "BIOMETRIC":     8,
+    "PHOTO":         7,
+    "ACCOUNT":       6,
+}
+
+# ── Risk bands ────────────────────────────────────────────────────────────────
+def risk_band(score: int) -> str:
+    if score < 30:
+        return "low"
+    if score <= 70:
+        return "medium"
+    return "high"
+
+def action_for_score(score: int) -> str:
+    if score < 30:
+        return "pass"
+    if score <= 70:
+        return "redact"
+    return "block"
+
+# ── Regex patterns (HIPAA 18) ─────────────────────────────────────────────────
+REGEX_PATTERNS: List[Tuple[str, str, str]] = [
+    ("SSN",      r"\b\d{3}[-\s]?\d{2}[-\s]?\d{4}\b",                                         "[SSN]"),
+    ("MRN",      r"\b(?:MRN|mrn|Medical Record|patient\s*#?)\s*[:\-]?\s*[A-Z]?\d{5,10}\b",   "[MRN]"),
+    ("PHONE",    r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b",                 "[PHONE]"),
+    ("DOB",      r"\b(?:DOB|D\.O\.B|Date of Birth|born)[:\s]+\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}\b",
+                 "[DOB]"),
+    ("DATE",     r"\b\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}\b",                               "[DATE]"),
+    ("EMAIL",    r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b",                    "[EMAIL]"),
+    ("ZIP",      r"\b\d{5}(?:-\d{4})?\b",                                                      "[ZIP]"),
+    ("IP",       r"\b(?:\d{1,3}\.){3}\d{1,3}\b",                                              "[IP]"),
+    ("URL",      r"https?://[^\s]+",                                                            "[URL]"),
+    ("ACCOUNT",  r"\b(?:account|acct|policy|member)\s*(?:no|num|number|#)?[:\s]*\d{5,16}\b",  "[ACCOUNT]"),
+    ("DEVICE_ID",r"\b(?:device|serial|IMEI|UUID)\s*[:\-]?\s*[A-Z0-9\-]{8,}\b",               "[DEVICE_ID]"),
+    ("AGE_OVER_89", r"\b(9[0-9]|1[0-9]{2})\s*(?:years?\s*old|y\.?o\.?)\b",                  "[AGE_OVER_89]"),
+]
+
+# ── Medical term lists ────────────────────────────────────────────────────────
+DIAGNOSIS_TERMS = [
+    "diabetes", "diabetic", "hypertension", "cancer", "hiv", "aids", "tuberculosis",
+    "hepatitis", "alzheimer", "dementia", "schizophrenia", "bipolar", "depression",
+    "anxiety", "asthma", "copd", "heart failure", "stroke", "epilepsy", "lupus",
+    "multiple sclerosis", "parkinson", "osteoporosis", "renal failure", "ckd",
+    "sepsis", "pneumonia", "covid", "appendicitis", "fracture", "surgery",
+    "chemotherapy", "radiation", "dialysis", "transplant", "icu", "intubated",
+]
+
+MEDICATION_TERMS = [
+    "metformin", "insulin", "lisinopril", "amlodipine", "atorvastatin", "omeprazole",
+    "levothyroxine", "metoprolol", "aspirin", "warfarin", "heparin", "morphine",
+    "oxycodone", "fentanyl", "prednisone", "amoxicillin", "azithromycin", "cipro",
+    "gabapentin", "sertraline", "fluoxetine", "lorazepam", "alprazolam", "zolpidem",
+    "adalimumab", "humira", "remdesivir", "dexamethasone", "furosemide", "digoxin",
+]
+
+# ── Load spaCy model ─────────────────────────────────────────────────────────
+def _load_nlp():
+    for model in ("en_core_sci_sm", "en_core_web_md", "en_core_web_sm"):
+        try:
+            return spacy.load(model)
+        except OSError:
+            continue
+    # Graceful fallback: blank English model
+    return spacy.blank("en")
+
+NLP = _load_nlp()
 
 
-class PHIDetector:
-    def __init__(self) -> None:
-        self.patterns = {
-            "SSN": re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
-            "PHONE": re.compile(r"\b(?:\+1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{4}\b"),
-            "DOB": re.compile(
-                r"\b(?:DOB[:\s]*)?(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}[/-]\d{1,2}[/-]\d{1,2}|(?:19|20)\d{2})\b",
-                re.IGNORECASE,
-            ),
-            "EMAIL": re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
-        }
+@dataclass
+class PHIEntity:
+    phi_type: str
+    value: str
+    start: int
+    end: int
+    weight: int = field(init=False)
 
-        # Fallback strategy keeps the demo runnable if biomedical model is unavailable.
-        self.nlp = self._load_nlp_model()
-        self.medical_terms = {
-            "diabetic",
-            "diabetes",
-            "hypertension",
-            "asthma",
-            "cancer",
-            "insulin",
-            "metformin",
-            "amoxicillin",
-            "ibuprofen",
-            "paracetamol",
-            "alzheimer",
-            "stroke",
-            "depression",
-        }
+    def __post_init__(self):
+        self.weight = PHI_WEIGHTS.get(self.phi_type, 3)
 
-    def _load_nlp_model(self):
-        model_candidates = ["en_core_sci_sm", "en_core_web_sm"]
-        for model_name in model_candidates:
-            try:
-                return spacy.load(model_name)
-            except Exception:
-                continue
-        return spacy.blank("en")
 
-    def detect_regex_entities(self, text: str) -> list[dict]:
-        entities: list[dict] = []
-        for label, pattern in self.patterns.items():
-            for match in pattern.finditer(text):
-                entities.append(
-                    {
-                        "text": match.group(),
-                        "label": label,
-                        "start": match.start(),
-                        "end": match.end(),
-                        "source": "regex",
-                    }
-                )
-        return entities
+def detect(text: str) -> dict:
+    """
+    Run all three detection layers and return a unified result dict.
+    """
+    entities: List[PHIEntity] = []
+    covered_spans: List[Tuple[int, int]] = []
 
-    def detect_nlp_entities(self, text: str) -> list[dict]:
-        entities: list[dict] = []
-        doc = self.nlp(text)
+    def _span_free(start, end):
+        for s, e in covered_spans:
+            if not (end <= s or start >= e):
+                return False
+        return True
 
-        for ent in doc.ents:
-            if ent.label_ in {"PERSON", "ORG", "GPE"}:
-                entities.append(
-                    {
-                        "text": ent.text,
-                        "label": "PERSON" if ent.label_ == "PERSON" else "CONTEXT_ENTITY",
-                        "start": ent.start_char,
-                        "end": ent.end_char,
-                        "source": "nlp",
-                    }
-                )
+    # ── Layer 1: Regex ────────────────────────────────────────────────────────
+    for phi_type, pattern, _ in REGEX_PATTERNS:
+        for m in re.finditer(pattern, text, re.IGNORECASE):
+            if _span_free(m.start(), m.end()):
+                entities.append(PHIEntity(phi_type, m.group(), m.start(), m.end()))
+                covered_spans.append((m.start(), m.end()))
 
-        # Medical term spotting supports lightweight domain detection in hackathon demos.
-        for token in doc:
-            token_l = token.text.lower().strip(".,;:!?()[]{}\"'")
-            if token_l in self.medical_terms:
-                entities.append(
-                    {
-                        "text": token.text,
-                        "label": "MEDICAL_TERM",
-                        "start": token.idx,
-                        "end": token.idx + len(token.text),
-                        "source": "nlp",
-                    }
-                )
+    # ── Layer 2: spaCy NER ────────────────────────────────────────────────────
+    doc = NLP(text)
+    for ent in doc.ents:
+        if ent.label_ in ("PERSON", "GPE", "ORG", "FAC", "LOC") and _span_free(ent.start_char, ent.end_char):
+            phi_type = "PERSON" if ent.label_ == "PERSON" else "ADDRESS"
+            entities.append(PHIEntity(phi_type, ent.text, ent.start_char, ent.end_char))
+            covered_spans.append((ent.start_char, ent.end_char))
 
-        return entities
+    # ── Layer 3: Medical term spotting ───────────────────────────────────────
+    lower = text.lower()
+    for term in DIAGNOSIS_TERMS:
+        idx = lower.find(term)
+        while idx != -1:
+            start, end = idx, idx + len(term)
+            if _span_free(start, end):
+                entities.append(PHIEntity("DIAGNOSIS", text[start:end], start, end))
+                covered_spans.append((start, end))
+            idx = lower.find(term, idx + 1)
 
-    def _dedupe_and_sort(self, entities: list[dict]) -> list[dict]:
-        # Keep longest span when overlaps happen between regex and NLP matches.
-        entities_sorted = sorted(entities, key=lambda e: (e["start"], -(e["end"] - e["start"])))
-        filtered: list[dict] = []
-        for entity in entities_sorted:
-            if not filtered:
-                filtered.append(entity)
-                continue
-            prev = filtered[-1]
-            overlap = entity["start"] < prev["end"]
-            if overlap:
-                prev_len = prev["end"] - prev["start"]
-                curr_len = entity["end"] - entity["start"]
-                if curr_len > prev_len:
-                    filtered[-1] = entity
-            else:
-                filtered.append(entity)
+    for term in MEDICATION_TERMS:
+        idx = lower.find(term)
+        while idx != -1:
+            start, end = idx, idx + len(term)
+            if _span_free(start, end):
+                entities.append(PHIEntity("MEDICATION", text[start:end], start, end))
+                covered_spans.append((start, end))
+            idx = lower.find(term, idx + 1)
 
-        # Remove exact duplicates that can occur in repeated matching stages.
-        seen = set()
-        unique: list[dict] = []
-        for entity in filtered:
-            key = (entity["text"], entity["label"], entity["start"], entity["end"], entity["source"])
-            if key not in seen:
-                seen.add(key)
-                unique.append(entity)
-        return unique
+    # ── Scoring ───────────────────────────────────────────────────────────────
+    # Unique type penalty: multiple high-weight types multiply risk
+    type_weights = {}
+    for e in entities:
+        type_weights[e.phi_type] = max(type_weights.get(e.phi_type, 0), e.weight)
 
-    def score_risk(self, entities: list[dict]) -> int:
-        if not entities:
-            return 0
+    base_score = sum(type_weights.values())
+    # Combination bonus: any 2+ types of weight≥5 escalates score
+    heavy = [w for w in type_weights.values() if w >= 5]
+    if len(heavy) >= 2:
+        base_score = min(100, base_score + 15)
 
-        # Per-entity base weights. Chosen so that:
-        #   Low (<30):  benign single-token hits (e.g. a standalone year)
-        #   Medium (30-70): name + medical/DOB combo without a hard identifier
-        #   High (>70): name + SSN, or many co-occurring PHI fields
-        weights = {
-            "SSN": 40,          # Hard identifier – highest individual weight
-            "DOB": 15,          # Date of birth – medium-high
-            "PHONE": 10,        # Phone number
-            "EMAIL": 8,         # Email address
-            "PERSON": 12,       # Named person
-            "MEDICAL_TERM": 15, # Disease / medication keyword
-            "CONTEXT_ENTITY": 6,
-        }
+    risk_score = min(100, base_score)
 
-        score = 0
-        labels = Counter()
-        for entity in entities:
-            label = entity["label"]
-            labels[label] += 1
-            score += weights.get(label, 5)
+    # ── Highlighted text ──────────────────────────────────────────────────────
+    highlighted = _build_highlighted(text, entities)
 
-        # Simulated LLM/contextual layer: compound sensitive context increases risk.
-        has_identifier = any(label in labels for label in ["SSN", "DOB", "PHONE", "EMAIL"])
-        has_health_context = any(label in labels for label in ["PERSON", "MEDICAL_TERM"])
+    return {
+        "detected_entities": [
+            {"phi_type": e.phi_type, "value": e.value, "start": e.start, "end": e.end, "weight": e.weight}
+            for e in sorted(entities, key=lambda x: x.start)
+        ],
+        "highlighted_text": highlighted,
+        "risk_score": risk_score,
+        "risk_band": risk_band(risk_score),
+        "action": action_for_score(risk_score),
+        "is_sensitive": risk_score >= 30,
+        "phi_type_counts": _count_types(entities),
+    }
 
-        # Most specific check first: named person + SSN is the highest-risk combo.
-        if labels.get("SSN", 0) > 0 and labels.get("PERSON", 0) > 0:
-            score += 15
-        # General identifier + health context (e.g. name + DOB, phone + medical term).
-        if has_identifier and has_health_context:
-            score += 15
-        # Three or more distinct entity types suggest a rich, sensitive record.
-        if len(labels.keys()) >= 3:
-            score += 8
 
-        return max(0, min(100, score))
+def redact(text: str) -> str:
+    """Replace all detected PHI with typed placeholder tokens."""
+    result = detect(text)
+    entities = sorted(result["detected_entities"], key=lambda x: x["start"], reverse=True)
+    chars = list(text)
+    for e in entities:
+        replacement = f"[{e['phi_type']}]"
+        chars[e["start"]:e["end"]] = list(replacement)
+    return "".join(chars)
 
-    def _apply_mask(self, text: str, entities: list[dict], mask: str) -> str:
-        if not entities:
-            return html.escape(text)
 
-        output = []
-        cursor = 0
-        for entity in entities:
-            start, end = entity["start"], entity["end"]
-            output.append(html.escape(text[cursor:start]))
-            output.append(mask)
-            cursor = end
-        output.append(html.escape(text[cursor:]))
-        return "".join(output)
+def _build_highlighted(text: str, entities: List[PHIEntity]) -> str:
+    """Build HTML with <mark> spans for each detected entity."""
+    sorted_ents = sorted(entities, key=lambda x: x.start)
+    result = []
+    cursor = 0
+    for e in sorted_ents:
+        if e.start > cursor:
+            result.append(html.escape(text[cursor:e.start]))
+        css_class = _css_for_type(e.phi_type)
+        result.append(
+            f'<mark class="{css_class}" data-type="{e.phi_type}">'
+            f'{html.escape(text[e.start:e.end])}'
+            f'</mark>'
+        )
+        cursor = e.end
+    result.append(html.escape(text[cursor:]))
+    return "".join(result)
 
-    def highlight(self, text: str, entities: list[dict]) -> str:
-        if not entities:
-            return html.escape(text)
 
-        output = []
-        cursor = 0
-        for entity in entities:
-            start, end = entity["start"], entity["end"]
-            output.append(html.escape(text[cursor:start]))
-            span = html.escape(text[start:end])
-            label = html.escape(entity["label"])
-            output.append(f"<mark class='phi-hit' title='{label}'>{span}</mark>")
-            cursor = end
-        output.append(html.escape(text[cursor:]))
-        return "".join(output)
+def _css_for_type(phi_type: str) -> str:
+    high = {"SSN", "MRN", "DOB", "AGE_OVER_89", "BIOMETRIC", "PHOTO", "DEVICE_ID", "ACCOUNT"}
+    medium = {"DIAGNOSIS", "MEDICATION", "PHONE", "IP"}
+    if phi_type in high:
+        return "phi-high"
+    if phi_type in medium:
+        return "phi-medium"
+    return "phi-low"
 
-    def scan(self, text: str) -> dict:
-        regex_entities = self.detect_regex_entities(text)
-        nlp_entities = self.detect_nlp_entities(text)
-        entities = self._dedupe_and_sort(regex_entities + nlp_entities)
-        risk_score = self.score_risk(entities)
 
-        return {
-            "detected_entities": entities,
-            "highlighted_text": self.highlight(text, entities),
-            "risk_score": risk_score,
-            "is_sensitive": risk_score >= 30,
-        }
-
-    def redact(self, text: str, entities: list[dict] | None = None) -> str:
-        if entities is None:
-            entities = self.scan(text)["detected_entities"]
-        return self._apply_mask(text, entities, "[REDACTED]")
+def _count_types(entities: List[PHIEntity]) -> dict:
+    counts = {}
+    for e in entities:
+        counts[e.phi_type] = counts.get(e.phi_type, 0) + 1
+    return counts

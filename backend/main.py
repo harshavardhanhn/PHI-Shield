@@ -1,75 +1,102 @@
-import json
-from datetime import datetime
+"""
+PHI-Shield — main.py
+FastAPI application entry point.
 
-from fastapi import Depends, FastAPI
+Run:  uvicorn main:app --reload --port 8000
+"""
+
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy.orm import Session
+from contextlib import asynccontextmanager
 
-from database import Base, engine, get_db
-from detector import PHIDetector
-from models import RedactResponse, ScanLog, ScanRequest, ScanResponse
+from models import (
+    ScanRequest, ScanResponse,
+    RedactRequest, RedactResponse,
+    LogEntry, StatsResponse,
+)
+from detector import detect, redact as do_redact
+from database import init_db, log_scan, get_logs, get_stats
 
-app = FastAPI(title="Real-Time PHI Leak Prevention System", version="1.0.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    yield
+
+
+app = FastAPI(
+    title="PHI-Shield API",
+    description="Real-time HIPAA PHI detection, redaction, and audit logging.",
+    version="2.0.0",
+    lifespan=lifespan,
+)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-Base.metadata.create_all(bind=engine)
-detector = PHIDetector()
 
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /scan
+# ─────────────────────────────────────────────────────────────────────────────
+@app.post("/scan", response_model=ScanResponse, summary="Scan message for PHI")
+def scan_message(req: ScanRequest):
+    if not req.message.strip():
+        raise HTTPException(status_code=422, detail="Message cannot be empty.")
 
-@app.get("/")
-def health_check():
-    return {
-        "status": "ok",
-        "service": "phi-leak-prevention",
-        "timestamp": datetime.utcnow().isoformat(),
-    }
+    result = detect(req.message)
 
-
-@app.post("/scan", response_model=ScanResponse)
-def scan_message(payload: ScanRequest, db: Session = Depends(get_db)):
-    result = detector.scan(payload.message)
-
-    log_entry = ScanLog(
-        message=payload.message,
-        highlighted_text=result["highlighted_text"],
+    # Persist to audit log (never store raw message, only preview)
+    log_scan(
+        sender=req.sender or "anonymous",
+        channel=req.channel or "email",
+        action=result["action"],
         risk_score=result["risk_score"],
-        is_sensitive=result["is_sensitive"],
-        detected_entities_json=json.dumps(result["detected_entities"]),
+        risk_band=result["risk_band"],
+        phi_types=list(result["phi_type_counts"].keys()),
+        phi_type_counts=result["phi_type_counts"],
+        message=req.message,
     )
-    db.add(log_entry)
-    db.commit()
 
     return result
 
 
-@app.post("/redact", response_model=RedactResponse)
-def redact_message(payload: ScanRequest):
-    redacted = detector.redact(payload.message)
-    return {"redacted_message": redacted}
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /redact
+# ─────────────────────────────────────────────────────────────────────────────
+@app.post("/redact", response_model=RedactResponse, summary="Redact PHI from message")
+def redact_message(req: RedactRequest):
+    if not req.message.strip():
+        raise HTTPException(status_code=422, detail="Message cannot be empty.")
+    return {"redacted_message": do_redact(req.message)}
 
 
-@app.get("/logs")
-def get_logs(db: Session = Depends(get_db)):
-    logs = db.query(ScanLog).order_by(ScanLog.created_at.desc()).all()
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /logs
+# ─────────────────────────────────────────────────────────────────────────────
+@app.get("/logs", summary="Retrieve audit log")
+def get_audit_logs(
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+):
+    return get_logs(limit=limit, offset=offset)
 
-    output = []
-    for item in logs:
-        output.append(
-            {
-                "id": item.id,
-                "message": item.message,
-                "highlighted_text": item.highlighted_text,
-                "risk_score": item.risk_score,
-                "is_sensitive": item.is_sensitive,
-                "detected_entities": json.loads(item.detected_entities_json),
-                "timestamp": item.created_at.isoformat(),
-            }
-        )
-    return output
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /stats
+# ─────────────────────────────────────────────────────────────────────────────
+@app.get("/stats", response_model=StatsResponse, summary="Dashboard statistics")
+def get_dashboard_stats():
+    return get_stats()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /health
+# ─────────────────────────────────────────────────────────────────────────────
+@app.get("/health", summary="Health check")
+def health():
+    return {"status": "ok", "version": "2.0.0"}

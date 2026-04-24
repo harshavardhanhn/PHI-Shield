@@ -1,37 +1,36 @@
-@import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700;800&display=swap");
-
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
-:root {
-  font-family: "Space Grotesk", sans-serif;
-}
-
-body {
-  margin: 0;
-  min-width: 320px;
-}
-
-.phi-hit {
-  background: #fee2e2;
-  color: #b91c1c;
-  border-radius: 0.25rem;
-  padding: 0 0.18rem;
-  font-weight: 700;
-}
-
-@keyframes fade-in {
-  from {
-    opacity: 0;
-    transform: translateY(8px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
+@layer base {
+  body {
+    @apply bg-gray-50 text-gray-900 antialiased;
+    font-family: 'Inter', system-ui, sans-serif;
   }
 }
 
-.animate-fade-in {
-  animation: fade-in 420ms ease-out;
+@layer components {
+  /* PHI highlight marks rendered from backend HTML */
+  mark.phi-high {
+    @apply bg-red-100 text-red-900 rounded px-0.5 font-medium not-italic;
+    border-bottom: 2px solid #dc2626;
+  }
+  mark.phi-medium {
+    @apply bg-amber-100 text-amber-900 rounded px-0.5 font-medium not-italic;
+    border-bottom: 2px solid #d97706;
+  }
+  mark.phi-low {
+    @apply bg-blue-100 text-blue-900 rounded px-0.5 font-medium not-italic;
+    border-bottom: 2px solid #2563eb;
+  }
+
+  /* Risk badge */
+  .badge-high   { @apply bg-red-100 text-red-800 text-xs font-semibold px-2.5 py-0.5 rounded-full; }
+  .badge-medium { @apply bg-amber-100 text-amber-800 text-xs font-semibold px-2.5 py-0.5 rounded-full; }
+  .badge-low    { @apply bg-green-100 text-green-800 text-xs font-semibold px-2.5 py-0.5 rounded-full; }
+
+  /* Stat card */
+  .stat-card {
+    @apply bg-white rounded-xl border border-gray-100 p-5 shadow-sm flex flex-col gap-1;
+  }
 }

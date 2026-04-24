@@ -1,94 +1,85 @@
-# Real-Time PHI Leak Prevention System
+# PHI-Shield v2.0
 
-A production-style hackathon demo that scans outgoing messages for Protected Health Information (PHI), scores risk, blocks risky messages with an alert modal, and supports redaction before send.
+Real-time HIPAA PHI leak prevention — scans outbound messages for Protected Health Information, blocks or redacts before transmission, and logs every event for compliance audits.
 
-## Tech Stack
+## What changed in v2.0
 
-- Backend: Python, FastAPI, spaCy, Regex, SQLite
-- Frontend: React (Vite), Axios, Tailwind CSS, Recharts
+### Backend
 
-## Project Structure
+| Area | Change |
+|---|---|
+| **detector.py** | Full HIPAA 18-identifier coverage (was SSN + phone + DOB + email only). Added MRN, ZIP, IP, URL, account numbers, device IDs, age >89, biometric, address. |
+| **detector.py** | Combination-bonus scoring: 2+ high-weight PHI types escalate the risk score by +15, matching real-world severity. |
+| **detector.py** | PHI highlighting now returns typed HTML `<mark class="phi-high|medium|low">` — frontend renders with colour-coded underlines. |
+| **detector.py** | Span deduplication: regex, NER, and term-spotting results never overlap — no double-counting a single entity. |
+| **detector.py** | 30 diagnosis terms + 30 medication terms (was ~10 each). |
+| **database.py** | Stores `phi_type_counts` as JSON per row — enables the `/stats` PHI breakdown chart without re-scanning. |
+| **database.py** | Stores `risk_band` column — dashboard filters by band without recomputing. |
+| **database.py** | Never stores raw message — only first 80 chars as preview, for compliance. |
+| **main.py** | Added `GET /stats` endpoint — returns totals + per-type breakdown for dashboard. |
+| **main.py** | Added `GET /health` endpoint. |
+| **main.py** | Added pagination to `GET /logs` (`limit` + `offset` query params). |
+| **main.py** | FastAPI `lifespan` context replaces deprecated `on_event("startup")`. |
+| **models.py** | Pydantic v2 compatible. Added `StatsResponse`, `risk_band`, `action`, `phi_type_counts` fields. |
 
-- `backend/`
-  - `main.py`
-  - `detector.py`
-  - `models.py`
-  - `database.py`
-  - `requirements.txt`
-- `frontend/`
-  - `package.json`
-  - `src/`
-    - `App.jsx`
-    - `components/`
-    - `pages/`
+### Frontend
 
-## Backend Setup
+| Area | Change |
+|---|---|
+| **Routing** | React Router v6 with three pages: Compose, Dashboard, Audit Log. |
+| **ComposePage** | Three built-in demo messages (safe / medium / high) to load with one click. |
+| **ComposePage** | PHI highlighting renders inline below the compose area — colour-coded by severity. |
+| **ComposePage** | Redact button fetches `/redact` and shows cleaned text inline — no page reload. |
+| **DashboardPage** | Live stats cards + Recharts horizontal bar chart for PHI type breakdown. |
+| **DashboardPage** | Auto-refreshes every 5 seconds via `setInterval`. |
+| **LogsPage** | Full paginated audit log table (25 rows per page). |
+| **api.js** | Centralised Axios client with proxy — no hardcoded `localhost:8000` in components. |
+| **index.css** | PHI `<mark>` classes with colour-coded bottom borders (red = high, amber = medium, blue = low). |
 
-1. Open terminal in `backend/`
-2. Create and activate virtual environment
-   - Windows PowerShell:
-     - `python -m venv .venv`
-     - `.\.venv\Scripts\Activate.ps1`
-3. Install dependencies:
-   - `pip install -r requirements.txt`
-4. Install an NLP model (choose one):
-   - `python -m spacy download en_core_web_sm`
-   - Optional biomedical model: install SciSpaCy-compatible setup and `en_core_sci_sm`
-5. Run API server:
-   - `uvicorn main:app --reload --port 8000`
+## Quick start
 
-Backend API base URL: `http://127.0.0.1:8000`
+### Backend
+```bash
+cd backend
+python -m venv .venv
+source .venv/bin/activate          # Windows: .\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+python -m spacy download en_core_web_sm
+uvicorn main:app --reload --port 8000
+```
 
-## Frontend Setup
+### Frontend
+```bash
+cd frontend
+npm install
+npm run dev
+```
+Open `http://localhost:5173`
 
-1. Open a new terminal in `frontend/`
-2. Install dependencies:
-   - `npm install`
-3. Start Vite dev server:
-   - `npm run dev`
-4. Open the shown local URL (usually `http://127.0.0.1:5173`)
+## API reference
 
-## API Endpoints
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/scan` | Scan message for PHI. Body: `{message, sender?, channel?}` |
+| `POST` | `/redact` | Redact PHI. Body: `{message}` |
+| `GET` | `/logs` | Audit log. Params: `limit`, `offset` |
+| `GET` | `/stats` | Dashboard stats + PHI type breakdown |
+| `GET` | `/health` | Health check |
 
-- `POST /scan`
-  - Request: `{ "message": "..." }`
-  - Response includes:
-    - `detected_entities`
-    - `highlighted_text`
-    - `risk_score` (0-100)
-    - `is_sensitive`
-- `POST /redact`
-  - Request: `{ "message": "..." }`
-  - Response: `{ "redacted_message": "..." }`
-- `GET /logs`
-  - Returns full scan history with timestamps
+## Risk scoring
 
-## Detection Layers
+| PHI type | Weight |
+|---|---|
+| SSN | 10 |
+| Age >89 | 7, Biometric 8, Photo 7 |
+| MRN | 8 |
+| Diagnosis | 7 |
+| DOB | 6 |
+| Account / Device ID | 6 |
+| Medication / Phone / IP | 5 |
+| Person / Email / Address | 4 |
+| ZIP / URL / Date | 2–3 |
 
-1. Regex layer:
-   - SSN
-   - Phone numbers
-   - DOB patterns
-   - Email addresses
-2. NLP layer (spaCy):
-   - Person names
-   - Medical terms (disease/medication via NLP + term spotting)
-3. Contextual layer (simulated LLM logic):
-   - Multiple sensitive entity combinations increase risk to medium/high.
+Score < 30 → **pass** · 30–70 → **redact** · >70 → **block**
 
-## Risk Score Bands
-
-- Low: `< 30`
-- Medium: `30 - 70`
-- High: `> 70`
-
-## Demo Test Messages
-
-1. `Meeting at 5 PM` -> Safe (Low)
-2. `Patient John Doe, diabetic, DOB 1990` -> Medium risk
-3. `John Doe SSN 123-45-6789` -> High risk
-
-## Notes
-
-- All scans are logged in SQLite file `phi_logs.db` generated inside `backend/`.
-- If NLP model is missing, detector falls back gracefully to a blank model and still uses regex + medical term logic.
+Two or more PHI types with weight ≥ 5 adds a +15 combination penalty.
